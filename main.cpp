@@ -22,21 +22,23 @@
  * THE SOFTWARE.
  *
  */
+#include <memory>
 #include <iostream>
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "MyFrontendAction.hpp"
+#include "SrcFile.hpp"
+
 std::map<std::string,Record*> Record::recordDB;
-std::vector<std::string> srcList;
+class SrcList SrcList;
 
 static llvm::cl::OptionCategory MyToolCategory("My tool options");
 static llvm::cl::extrahelp CommonHelp(clang::tooling::CommonOptionsParser::HelpMessage);
 int main(int argc, char const* argv[])
 {
 	clang::tooling::CommonOptionsParser op(argc,argv,MyToolCategory);
-	srcList = op.getSourcePathList();
-	for (auto&& src : srcList) {
-		::printf("%s\n",src.c_str());
-	}
+
+	SrcList.add(op.getSourcePathList());
+
 	clang::tooling::ClangTool tool(op.getCompilations(),op.getSourcePathList());
 	tool.run(clang::tooling::newFrontendActionFactory<FindNamedClassAction>().get());
 

@@ -26,6 +26,7 @@
 #define MYFRONTENDACTION_HPP #include <cstdio>
 #include <sstream>
 #include <algorithm>
+#include <unistd.h>
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -33,8 +34,9 @@
 #include "clang/Tooling/Tooling.h"
 
 #include "ClassData.hpp"
+#include "SrcFile.hpp"
 
-#define VERBOSE 1
+#define VERBOSE 0
 #if VERBOSE
 #define TRACE() \
 	do { \
@@ -47,18 +49,120 @@
 #endif
 using namespace clang;
 
-extern std::vector<std::string> srcList;
+extern class SrcList SrcList;
 
 static bool isTargetFile(const std::string& fname)
 {
-	auto itr = find(srcList.begin(),srcList.end(),fname);
-	return (itr != srcList.end())?true:false;
+	return SrcList.contain(fname);
 }
 
-static std::string getBaseNameOnly(const std::string& str)
+class LocationFacade/*{{{*/
 {
-	return split(basename(str),':')[0];
+	private:
+		std::string mLocStr;
+		static const int FILENAME = 0;
+		static const int LINE = 1;
+		static const int COL = 2;
+	public:
+		LocationFacade(const SourceManager& aSM,const SourceLocation& aLoc)
+			:mLocStr(aLoc.printToString(aSM)){ }
+		const std::string getFileName() {
+			return split(mLocStr,':')[0];
+		}
+};/*}}}*/
+
+class QualTypeFacade
+{
+	private:
+		const QualType mType;
+	public:
+		QualTypeFacade(const QualType& aType)
+			:mType(aType){}
+		std::string show() {
+			const clang::Type* t = mType.getTypePtr();
+			return (t->getPointeeCXXRecordDecl())?
+				t->getPointeeCXXRecordDecl()->getNameAsString():"";
+		}
+};
+
+static std::string _asToStr(clang::AccessSpecifier aAs) {
+	switch (aAs) {
+		case AS_public:
+			return "public";
+		case AS_protected:
+			return "protected";
+		case AS_private:
+			return "private";
+		default:
+			return "";
+	}
 }
+
+class CXXRecordDeclFacade
+{
+private:
+	CXXRecordDecl* mCXXRecordDecl;
+	PrintingPolicy mPolicy;
+public:
+
+	CXXRecordDeclFacade(CXXRecordDecl* aCXXRecordDecl,PrintingPolicy& aPolicy)
+		: mCXXRecordDecl(aCXXRecordDecl),mPolicy(aPolicy) {}
+
+	std::vector<std::string> showAllBaseClasses() {
+		std::vector<std::string> ret;
+		for (auto&& b : mCXXRecordDecl->bases()) {
+			const clang::Type* t = b.getType().getTypePtr();
+			std::string typeStr = t->getAsCXXRecordDecl()?
+				t->getAsCXXRecordDecl()->getNameAsString():"error";
+			ret.push_back(typeStr);
+			::printf("base class:%s\n",ret.back().c_str());
+		}
+		return ret;
+	}
+
+	std::vector<FunctionDesc> getAllFunction() {
+		std::vector<FunctionDesc> ret;
+		for (auto&& m : mCXXRecordDecl->methods()) {
+			FunctionDesc desc;
+			desc.access = _asToStr(m->getAccess());
+			desc.name = m->getNameAsString();
+			desc.type = m->getReturnType().getAsString(mPolicy);
+			ret.push_back(desc);
+		}
+		return ret;
+	}
+};
+
+class FieldDeclFacade
+{
+private:
+		FieldDecl* mFieldDecl;
+public:
+		FieldDeclFacade(FieldDecl* aFieldDecl)
+			: mFieldDecl(aFieldDecl){}
+		std::string showParent() {
+			return mFieldDecl->getParent()->getNameAsString();
+		}
+		std::string showName() {
+			return mFieldDecl->getNameAsString();
+		}
+#if 0
+		std::string showType() {
+			const clang::Type* t = _getType();
+			return (t->getPointeeCXXRecordDecl())?
+				t->getPointeeCXXRecordDecl()->getNameAsString():
+				mFieldDecl->getType().getAsString(Policy);
+		}
+#endif
+		const TemplateSpecializationType* getTemplateSpecializationType() {
+			return _getType()->getAs<clang::TemplateSpecializationType>();
+		}
+private:
+		const clang::Type* _getType() {
+			return mFieldDecl->getType().getTypePtr();
+		}
+};
+
 static std::string showDeclContents(clang::Decl* D)
 {
 	std::string buf;
@@ -107,12 +211,13 @@ class FindNamedClassVisitor
 		void CollectAllClass(DeclContext* aDeclContext) {/*{{{*/
 			for (DeclContext::decl_iterator i = aDeclContext->decls_begin(), e = aDeclContext->decls_end(); i != e; i++) {
 				Decl* D = *i;
-				std::string str = D->getLocation().printToString(*SM);
-				std::string fileName = getBaseNameOnly(str);
-				DEBUGPRINT("%s\n",fileName.c_str());
+				LocationFacade loc(*SM,D->getLocation());
 
-				if(!isTargetFile(fileName))
+				if(!isTargetFile(loc.getFileName())) {
 					continue;
+				}
+
+				::printf("TARGETFILE:%s\n",loc.getFileName().c_str());
 
 				if (NamedDecl *N = dyn_cast<NamedDecl>(D)) {
 					std::string kind = D->getDeclKindName();
@@ -120,7 +225,21 @@ class FindNamedClassVisitor
 						std::stringstream str;
 						str << D->getDeclKindName() << " :"<< N->getNameAsString();
 						DEBUGPRINT("%s\n",str.str().c_str());
-						Record::maybeAddClass(N->getNameAsString());
+						std::string name = N->getNameAsString();
+						Record::maybeAddClass(name);
+
+						CXXRecordDeclFacade CxxRecord =
+						   	CXXRecordDeclFacade(dyn_cast<CXXRecordDecl>(D),Policy);
+
+						for (auto&& b : CxxRecord.showAllBaseClasses()) {
+							::printf("found base class\n");
+							Record::maybeAddClass(b);
+							Record::addBase(N->getNameAsString(),b);
+						}
+
+						for (auto&& m : CxxRecord.getAllFunction()) {
+							Record::addMethod(name,m.name,m.type,m.access);
+						}
 					}
 				}
 			}
@@ -131,11 +250,9 @@ class FindNamedClassVisitor
 
 			for (DeclContext::decl_iterator i = aDeclContext->decls_begin(), e = aDeclContext->decls_end(); i != e; i++) {
 				Decl* D = *i;
-				std::string str = D->getLocation().printToString(*SM);
-				std::string fileName = getBaseNameOnly(str);
-				DEBUGPRINT("%s\n",fileName.c_str());
+				LocationFacade loc(*SM,D->getLocation());
 
-				if(!isTargetFile(fileName))
+				if(!isTargetFile(loc.getFileName()))
 					continue;
 
 				if (NamedDecl *N = dyn_cast<NamedDecl>(D)) {
@@ -150,6 +267,10 @@ class FindNamedClassVisitor
 			}
 
 		}/*}}}*/
+		bool VisitCallExpr(CallExpr* aCallExpr) {
+			::printf("callexpr");
+			return true;
+		}
 
 		bool VisitCXXRecordDecl(CXXRecordDecl* Declaration) {/*{{{*/
 			TRACE();
@@ -161,10 +282,10 @@ class FindNamedClassVisitor
 
 		bool VisitFieldDecl(FieldDecl* aFieldDecl) {
 			TRACE();
+			FieldDeclFacade fd(aFieldDecl);
 
-			std::string parent = aFieldDecl->getParent()->getNameAsString();
-			std::string name = aFieldDecl->getNameAsString();
-			//std::string type = aFieldDecl->getType().split().Ty->getAsString(Policy);
+			std::string parent = fd.showParent();
+			std::string name = fd.showName();
 
 			std::string type;
 			const clang::Type* t = aFieldDecl->getType().getTypePtr();
@@ -184,6 +305,7 @@ class FindNamedClassVisitor
 
 			// template type
 			if(tmpType) {
+				bool containTargetClass = false;
 				if(int num = tmpType->getNumArgs()) {
 					DEBUGPRINT("template type found:%s\n",type.c_str());
 					const clang::TemplateArgument* args = tmpType->getArgs();
@@ -192,8 +314,12 @@ class FindNamedClassVisitor
 						if(Record::isTargetClassType(showTemplateArgs(&args[i]))) {
 							Record::addField(parent,name,showTemplateArgs(&args[i]),"",
 									true);
+							containTargetClass = true;
 						}
 					}
+				}
+				if(not containTargetClass) {
+					Record::addField(parent,name,type,"", false);
 				}
 			}
 
@@ -224,6 +350,7 @@ class FindNamedClassConsumer
 			TRACE();
 
 			Visitor.CollectAllClass(Context.getTranslationUnitDecl());
+
 			Visitor.PrintAllClassLoc(Context.getTranslationUnitDecl());
 //			Visitor.TraverseDecl(Context.getTranslationUnitDecl());
 //			Visitor.EnumerateDecl(Context.getTranslationUnitDecl());
